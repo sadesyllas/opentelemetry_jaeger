@@ -1,6 +1,6 @@
 defmodule OpenTelemetryJaeger do
   @moduledoc """
-  `OpentelemetryJaeger` is a library for exporting [OpenTelemetry](https://opentelemetry.io/)
+  `OpenTelemetryJaeger` is a library for exporting [OpenTelemetry](https://opentelemetry.io/)
   trace data, as modeled by [opentelemetry-erlang](https://github.com/open-telemetry/opentelemetry-erlang),
   to a [Jaeger](https://www.jaegertracing.io/) endpoint.
 
@@ -11,10 +11,26 @@ defmodule OpenTelemetryJaeger do
     processors: [
       otel_batch_processor: %{
         exporter: {OpenTelemetryJaeger, %{
+          # Defaults to `:agent`.
+          endpoint_type: :agent,
+
+          # Defaults to `"localhost"`.
           host: "localhost",
+
+          # Defaults to `6832`.
           port: 6832,
-          service_name: "MyService", # Defaults to `Mix.Project.config()[:app]`, in PascalCase.
-          service_version: "MyServiceVersion" # Defaults to `Mix.Project.config()[:version]`.
+
+          # Used only when `endpoint_type` is set to `:collector`.
+          http_headers: [{"X-Foo", "Bar"}],
+
+          # https://hexdocs.pm/finch/Finch.html#start_link/1
+          finch_pool_settings: [],
+
+          # Defaults to `Mix.Project.config()[:app]`, in PascalCase.
+          service_name: "MyService",
+
+          # Defaults to `Mix.Project.config()[:version]`.
+          service_version: "MyServiceVersion"
         }}
       }
     ]
@@ -26,13 +42,30 @@ defmodule OpenTelemetryJaeger do
 
   require Jaeger.Thrift.TagType, as: TagType
 
-  @keys [:host, :port, :service_name, :service_version]
+  @keys [
+    :endpoint_type,
+    :host,
+    :port,
+    :http_headers,
+    :finch_pool_settings,
+    :service_name,
+    :service_version
+  ]
   @enforce_keys @keys
   defstruct @keys
 
   @type t :: %__MODULE__{
+          endpoint_type: :agent | :collector,
           host: charlist(),
           port: pos_integer(),
+          http_headers: [{binary(), binary()}],
+          finch_pool_settings: [
+            protocol: :http1 | :http2,
+            size: pos_integer(),
+            count: pos_integer(),
+            max_idle_time: pos_integer() | :infinity,
+            conn_opts: list()
+          ],
           service_name: binary(),
           service_version: binary()
         }
@@ -43,36 +76,13 @@ defmodule OpenTelemetryJaeger do
   @doc """
   Initializes the exporter's configuration by constructing a `t:OpenTelemetryJaeger.t/0`.
   """
-  @spec init(map()) :: {:ok, t()}
+  @spec init(map()) :: {:ok, t()} | {:error, term()}
   def init(opts) when is_map(opts) do
-    host =
-      opts
-      |> Map.get(:host, "localhost")
-      |> to_charlist()
-
-    port = Map.get(opts, :port, 6832)
-
-    service_name =
-      Map.get_lazy(opts, :service_name, fn ->
-        Mix.Project.config()
-        |> Keyword.get(:app)
-        |> to_string()
-        |> Macro.camelize()
-      end)
-
-    service_version =
-      Map.get_lazy(opts, :service_version, fn ->
-        Mix.Project.config()[:version]
-      end)
-
-    opts = %__MODULE__{
-      host: host,
-      port: port,
-      service_name: service_name,
-      service_version: service_version
-    }
-
-    {:ok, opts}
+    with {:ok, _} <- init_dynamic_supervisor(),
+         %__MODULE__{} = opts = init_opts(opts),
+         :ok <- init_http_client(opts) do
+      {:ok, opts}
+    end
   end
 
   @doc """
@@ -80,7 +90,7 @@ defmodule OpenTelemetryJaeger do
 
   Then, it sends the batch to the specified Jaeger endpoint.
   """
-  @spec export(atom() | :ets.tid(), :otel_resource.t(), term()) :: :ok
+  @spec export(atom() | :ets.tid(), :otel_resource.t(), term()) :: :ok | {:error, term()}
   def export(ets_table, resource, opts) do
     _ = :otel_resource.attributes(resource)
 
@@ -103,8 +113,106 @@ defmodule OpenTelemetryJaeger do
   @spec shutdown(term()) :: :ok
   def shutdown(_), do: :ok
 
+  @spec init_dynamic_supervisor() :: Supervisor.on_start()
+  defp init_dynamic_supervisor() do
+    DynamicSupervisor.start_link(
+      strategy: :one_for_one,
+      name: OpenTelemetryJaeger.DynamicSupervisor
+    )
+  end
+
+  @spec init_opts(map()) :: t()
+  defp init_opts(opts) when is_map(opts) do
+    endpoint_type = Map.get(opts, :endpoint_type, :agent)
+
+    host =
+      opts
+      |> Map.get(:host, "localhost")
+      |> to_charlist()
+
+    port = Map.get(opts, :port, 6832)
+    http_headers = Map.get(opts, :http_headers, [])
+
+    finch_pool_settings =
+      opts
+      |> Map.get(:finch_pool_settings, [])
+      |> Keyword.put_new(:protocol, :http1)
+      |> Keyword.put_new(:size, 10)
+      |> Keyword.put_new(:count, 1)
+      |> Keyword.put_new(:max_idle_time, :infinity)
+      |> Keyword.put_new(:conn_opts, [])
+
+    service_name =
+      Map.get_lazy(opts, :service_name, fn ->
+        Mix.Project.config()
+        |> Keyword.get(:app)
+        |> to_string()
+        |> Macro.camelize()
+      end)
+
+    service_version =
+      Map.get_lazy(opts, :service_version, fn ->
+        Mix.Project.config()[:version]
+      end)
+
+    %__MODULE__{
+      endpoint_type: endpoint_type,
+      host: host,
+      port: port,
+      http_headers: http_headers,
+      finch_pool_settings: finch_pool_settings,
+      service_name: service_name,
+      service_version: service_version
+    }
+  end
+
+  @spec init_http_client(t()) :: :ok | {:error, term()}
+  defp init_http_client(opts)
+  defp init_http_client(%__MODULE__{endpoint_type: :agent}), do: :ok
+
+  defp init_http_client(%__MODULE__{endpoint_type: :collector} = opts) do
+    init_http_client_if_not_started(:persistent_term.get(__MODULE__, false), opts)
+  end
+
+  @spec init_http_client_if_not_started(boolean(), t()) :: :ok | {:error, term()}
+  defp init_http_client_if_not_started(started, opts)
+  defp init_http_client_if_not_started(true, _opts), do: :ok
+
+  defp init_http_client_if_not_started(false, opts) do
+    %__MODULE__{host: host, port: port, finch_pool_settings: finch_pool_settings} = opts
+
+    DynamicSupervisor.start_child(
+      OpenTelemetryJaeger.DynamicSupervisor,
+      {
+        Finch,
+        name: OpenTelemetryJaeger.Finch,
+        pools: %{
+          "#{host}:#{port}" => finch_pool_settings
+        }
+      }
+    )
+    |> case do
+      {:ok, _pid} ->
+        :ok
+
+      {:ok, _pid, _info} ->
+        :ok
+
+      :ignore ->
+        {:error, {:finch_start_error, :ignore}}
+
+      {:error, {:already_started, _pid}} ->
+        :ok
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
   @spec prepare_payload([tuple()], t()) :: binary
-  defp prepare_payload(spans, opts) do
+  defp prepare_payload(spans, opts)
+
+  defp prepare_payload(spans, %__MODULE__{endpoint_type: :agent} = opts) do
     batch = %{
       Agent.EmitBatchArgs.new()
       | batch: prepare_batch(spans, opts)
@@ -112,6 +220,13 @@ defmodule OpenTelemetryJaeger do
 
     batch
     |> Agent.EmitBatchArgs.serialize()
+    |> IO.iodata_to_binary()
+  end
+
+  defp prepare_payload(spans, %__MODULE__{endpoint_type: :collector} = opts) do
+    spans
+    |> prepare_batch(opts)
+    |> Batch.serialize()
     |> IO.iodata_to_binary()
   end
 
@@ -138,7 +253,10 @@ defmodule OpenTelemetryJaeger do
   end
 
   @spec send_payload(binary(), t()) :: :ok
-  defp send_payload(data, %__MODULE__{host: host, port: port}) do
+  defp send_payload(data, opts)
+
+  defp send_payload(data, %__MODULE__{endpoint_type: :agent} = opts) do
+    %__MODULE__{host: host, port: port} = opts
     {:ok, server} = :gen_udp.open(0)
 
     message =
@@ -154,6 +272,23 @@ defmodule OpenTelemetryJaeger do
     :ok = :gen_udp.send(server, host, port, [message | data])
 
     :gen_udp.close(server)
+
+    :ok
+  end
+
+  defp send_payload(data, %__MODULE__{endpoint_type: :collector} = opts) do
+    %__MODULE__{host: host, port: port, http_headers: http_headers} = opts
+    http_headers = [{"Content-Type", "application/x-thrift"} | http_headers]
+    url = "#{host}:#{port}/api/traces?format=jaeger.thrift"
+    request = Finch.build(:post, url, http_headers, data)
+
+    request
+    |> Finch.request(OpenTelemetryJaeger.Finch)
+    |> case do
+      {:ok, %Finch.Response{status: 202}} -> :ok
+      {:ok, %Finch.Response{status: status, body: body}} -> {:error, {status, body}}
+      {:error, _} = error -> error
+    end
 
     :ok
   end

@@ -1,6 +1,6 @@
 # OpenTelemetryJaeger
 
-`OpentelemetryJaeger` is a library for exporting [OpenTelemetry](https://opentelemetry.io/)
+`OpenTelemetryJaeger` is a library for exporting [OpenTelemetry](https://opentelemetry.io/)
 trace data, as modeled by [opentelemetry-erlang](https://github.com/open-telemetry/opentelemetry-erlang),
 to a [Jaeger](https://www.jaegertracing.io/) endpoint.
 
@@ -11,10 +11,26 @@ config :opentelemetry,
   processors: [
     otel_batch_processor: %{
       exporter: {OpenTelemetryJaeger, %{
+        # Defaults to `:agent`.
+        endpoint_type: :agent,
+
+        # Defaults to `"localhost"`.
         host: "localhost",
+
+        # Defaults to `6832`.
         port: 6832,
-        service_name: "MyService", # Defaults to `Mix.Project.config()[:app]`, in PascalCase.
-        service_version: "MyServiceVersion" # Defaults to `Mix.Project.config()[:version]`.
+
+        # Used only when `endpoint_type` is set to `:collector`.
+        http_headers: [{"X-Foo", "Bar"}],
+
+        # https://hexdocs.pm/finch/Finch.html#start_link/1
+        finch_settings: [],
+
+        # Defaults to `Mix.Project.config()[:app]`, in PascalCase.
+        service_name: "MyService",
+
+        # Defaults to `Mix.Project.config()[:version]`.
+        service_version: "MyServiceVersion"
       }}
     }
   ]

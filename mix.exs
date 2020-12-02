@@ -1,7 +1,7 @@
-defmodule OpentelemetryJaeger.MixProject do
+defmodule OpenTelemetryJaeger.MixProject do
   use Mix.Project
 
-  def project do
+  def project() do
     [
       app: :opentelemetry_jaeger,
       version: "0.1.0",
@@ -22,6 +22,7 @@ defmodule OpentelemetryJaeger.MixProject do
         extras: ["README.md"],
         filter_prefix: "OpenTelemetryJaeger"
       ],
+
       # Package
       package: [
         name: "OpenTelemetryJaeger",
@@ -29,24 +30,21 @@ defmodule OpentelemetryJaeger.MixProject do
         licences: ["MIT"],
         links: %{
           "GitHub" => "https://github.com/sadesyllas/opentelemetry_jaeger",
-          "OpenTelemetry.io" => "https://opentelemetry.io",
+          "OpenTelemetry" => "https://opentelemetry.io",
           "OpenTelemetry/Erlang" => "https://github.com/open-telemetry/opentelemetry-erlang"
         }
       ]
     ]
   end
 
-  def application do
-    [
-      extra_applications: []
-    ]
-  end
+  def application(), do: [extra_applications: []]
 
-  defp deps do
+  defp deps() do
     [
       {:opentelemetry, "~> 0.5.0"},
       {:opentelemetry_api, "~> 0.5.0"},
       {:thrift, github: "pinterest/elixir-thrift"},
+      {:finch, "~> 0.5.2"},
       {:credo, "~> 1.5", only: [:dev, :test], runtime: false, optional: true},
       {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false, optional: true},
       {:ex_doc, "~> 0.23", only: :dev, runtime: false, optional: false}

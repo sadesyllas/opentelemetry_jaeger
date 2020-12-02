@@ -1,8 +1,8 @@
-defmodule OpentelemetryJaegerTest do
+defmodule OpenTelemetryJaegerTest do
   use ExUnit.Case
-  doctest OpentelemetryJaeger
+  doctest OpenTelemetryJaeger
 
   test "greets the world" do
-    assert OpentelemetryJaeger.hello() == :world
+    assert OpenTelemetryJaeger.hello() == :world
   end
 end
