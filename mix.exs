@@ -15,7 +15,7 @@ defmodule OpenTelemetryJaeger.MixProject do
       # Documentation
       name: "OpenTelemetryJaeger",
       source_url: "https://github.com/sadesyllas/opentelemetry_jaeger",
-      homepage_url: "https://github.com/sadesyllas/opentelemetry_jaeger",
+      # homepage_url: "./index.html",
       docs: [
         main: "OpenTelemetryJaeger",
         logo: "OpenTelemetryJaeger.png",
@@ -27,7 +27,7 @@ defmodule OpenTelemetryJaeger.MixProject do
       package: [
         name: "OpenTelemetryJaeger",
         description: "A library to export OpenTelemetry spans to Jaeger.",
-        licences: ["MIT"],
+        licenses: ["MIT"],
         links: %{
           "GitHub" => "https://github.com/sadesyllas/opentelemetry_jaeger",
           "OpenTelemetry" => "https://opentelemetry.io",

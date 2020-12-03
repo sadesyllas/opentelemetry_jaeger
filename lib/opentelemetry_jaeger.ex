@@ -23,6 +23,11 @@ defmodule OpenTelemetryJaeger do
           # Used only when `endpoint_type` is set to `:collector`.
           http_headers: [{"X-Foo", "Bar"}],
 
+          # Defaults to `OpenTelemetryJaeger.SpanRefTypeMapperDefault` and if set, the module must implement the
+          # `OpenTelemetryJaeger.SpanRefTypeMapper` protocol. It is used when using linking spans together and the
+          # implementation for `Any` returns `SpanRefType.child_of()`.
+          span_ref_type_mapper: MySpanRefTypeMapper,
+
           # https://hexdocs.pm/finch/Finch.html#start_link/1
           finch_pool_settings: [],
 
@@ -38,6 +43,10 @@ defmodule OpenTelemetryJaeger do
 
   When the project is compiled, the [Jaeger Thrift IDL](https://github.com/jaegertracing/jaeger-idl/tree/master/thrift)
   files, stored in the `priv` directory, are compiled and the output is stored in `lib/jaeger/thrift`.
+
+  For the meaning of the configuration key `span_ref_type_mapper`, see `OpenTelemetryJaeger.SpanRefTypeMapper`.
+
+  Internally, `OpenTelemetryJaeger` starts a `DynamicSupervisor` to supervise the connection processes started by `Finch`.
   """
 
   require Jaeger.Thrift.TagType, as: TagType
@@ -47,6 +56,7 @@ defmodule OpenTelemetryJaeger do
     :host,
     :port,
     :http_headers,
+    :span_ref_type_mapper,
     :finch_pool_settings,
     :service_name,
     :service_version
@@ -58,7 +68,8 @@ defmodule OpenTelemetryJaeger do
           endpoint_type: :agent | :collector,
           host: charlist(),
           port: pos_integer(),
-          http_headers: [{binary(), binary()}],
+          http_headers: [{String.t(), String.t()}],
+          span_ref_type_mapper: struct() | nil,
           finch_pool_settings: [
             protocol: :http1 | :http2,
             size: pos_integer(),
@@ -66,11 +77,12 @@ defmodule OpenTelemetryJaeger do
             max_idle_time: pos_integer() | :infinity,
             conn_opts: list()
           ],
-          service_name: binary(),
-          service_version: binary()
+          service_name: String.t(),
+          service_version: String.t()
         }
 
-  alias Jaeger.Thrift.{Agent, Batch, Log, Process, Span, Tag}
+  alias Jaeger.Thrift.{Agent, Batch, Log, Process, Span, SpanRef, Tag}
+  alias OpenTelemetryJaeger.{SpanRefTypeMapper, SpanRefTypeMapperDefault}
   alias Thrift.Protocol.Binary
 
   @doc """
@@ -94,13 +106,8 @@ defmodule OpenTelemetryJaeger do
   def export(ets_table, resource, opts) do
     _ = :otel_resource.attributes(resource)
 
-    :ets.foldl(
-      fn span, acc ->
-        [span | acc]
-      end,
-      [],
-      ets_table
-    )
+    fn span, acc -> [span | acc] end
+    |> :ets.foldl([], ets_table)
     |> prepare_payload(opts)
     |> send_payload(opts)
 
@@ -112,6 +119,21 @@ defmodule OpenTelemetryJaeger do
   """
   @spec shutdown(term()) :: :ok
   def shutdown(_), do: :ok
+
+  @doc """
+  Converts an `:opentelemetry.trace_id()` into its lowercase hexadecimal string representation.
+  """
+  @spec to_hex_trace_id(non_neg_integer()) :: String.t()
+  def to_hex_trace_id(trace_id) when is_integer(trace_id) and trace_id > 0 do
+    <<trace_id::128>>
+    |> :binary.bin_to_list()
+    |> Enum.map(fn byte ->
+      byte
+      |> Integer.to_string(16)
+      |> String.downcase()
+    end)
+    |> Enum.join()
+  end
 
   @spec init_dynamic_supervisor() :: Supervisor.on_start()
   defp init_dynamic_supervisor() do
@@ -132,6 +154,12 @@ defmodule OpenTelemetryJaeger do
 
     port = Map.get(opts, :port, 6832)
     http_headers = Map.get(opts, :http_headers, [])
+    span_ref_type_mapper = Map.get(opts, :span_ref_type_mapper, SpanRefTypeMapperDefault)
+
+    span_ref_type_mapper =
+      if span_ref_type_mapper == nil or Code.ensure_loaded?(span_ref_type_mapper),
+        do: struct!(span_ref_type_mapper),
+        else: raise("#{inspect(span_ref_type_mapper)} is not a loaded module.")
 
     finch_pool_settings =
       opts
@@ -160,6 +188,7 @@ defmodule OpenTelemetryJaeger do
       host: host,
       port: port,
       http_headers: http_headers,
+      span_ref_type_mapper: span_ref_type_mapper,
       finch_pool_settings: finch_pool_settings,
       service_name: service_name,
       service_version: service_version
@@ -240,7 +269,7 @@ defmodule OpenTelemetryJaeger do
             Tag.new()
             | key: "client.version",
               v_str: opts.service_version,
-              v_type: 0
+              v_type: TagType.string()
           }
         ]
     }
@@ -248,7 +277,7 @@ defmodule OpenTelemetryJaeger do
     %{
       Batch.new()
       | process: process,
-        spans: to_jaeger_spans(spans)
+        spans: to_jaeger_spans(spans, opts)
     }
   end
 
@@ -293,37 +322,42 @@ defmodule OpenTelemetryJaeger do
     :ok
   end
 
-  @spec to_jaeger_spans([tuple()]) :: [Span.t()]
-  defp to_jaeger_spans(spans), do: Enum.map(spans, &to_jaeger_span/1)
+  @spec to_jaeger_spans([tuple()], t()) :: [Span.t()]
+  defp to_jaeger_spans(spans, opts), do: Enum.map(spans, &to_jaeger_span(&1, opts))
 
-  @spec to_jaeger_span({
-          :span,
-          :opentelemetry.trace_id() | :undefined,
-          :opentelemetry.span_id() | :undefined,
-          :opentelemetry.tracestate() | :undefined,
-          :opentelemetry.span_id() | :undefined,
-          binary() | atom(),
-          :opentelemetry.span_kind() | :undefined,
-          :opentelemetry.timestamp(),
-          :opentelemetry.timestamp() | :undefined,
-          :opentelemetry.attributes() | :undefined,
-          :opentelemetry.events(),
-          :opentelemetry.links(),
-          :opentelemetry.status() | :undefined,
-          integer() | :undefined,
-          boolean() | :undefined,
-          tuple() | :undefined
-        }) :: Span.t()
+  @spec to_jaeger_span(
+          {
+            :span,
+            :opentelemetry.trace_id() | :undefined,
+            :opentelemetry.span_id() | :undefined,
+            :opentelemetry.tracestate() | :undefined,
+            :opentelemetry.span_id() | :undefined,
+            String.t() | atom(),
+            :opentelemetry.span_kind() | :undefined,
+            :opentelemetry.timestamp(),
+            :opentelemetry.timestamp() | :undefined,
+            :opentelemetry.attributes() | :undefined,
+            :opentelemetry.events(),
+            :opentelemetry.links(),
+            :opentelemetry.status() | :undefined,
+            integer() | :undefined,
+            boolean() | :undefined,
+            tuple() | :undefined
+          },
+          t()
+        ) :: Span.t()
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp to_jaeger_span(
-         {:span, trace_id, span_id, state, parent_span_id, name, kind, start_time, end_time,
-          attributes, events, links, status, flags, is_recording, instrumentation_library}
+         {:span, trace_id, span_id, trace_state, parent_span_id, name, kind, start_time, end_time,
+          attributes, events, links, status, flags, is_recording, instrumentation_library},
+         %__MODULE__{span_ref_type_mapper: span_ref_type_mapper}
        )
        when ((is_integer(trace_id) and trace_id > 0) or trace_id == :undefined) and
               ((is_integer(span_id) and span_id > 0) or span_id == :undefined) and
-              (is_list(state) or state == :undefined) and
+              (is_list(trace_state) or trace_state == :undefined) and
               ((is_integer(parent_span_id) and parent_span_id > 0) or parent_span_id == :undefined) and
-              (is_binary(name) or is_atom(name)) and is_atom(kind) and
+              (is_binary(name) or is_atom(name)) and
+              (is_atom(kind) or kind == :undefined) and
               is_integer(start_time) and
               (is_integer(end_time) or end_time == :undefined) and
               (is_list(attributes) or attributes == :undefined) and
@@ -333,55 +367,42 @@ defmodule OpenTelemetryJaeger do
               (is_integer(flags) or flags == :undefined) and
               (is_boolean(is_recording) or is_recording == :undefined) and
               (is_tuple(instrumentation_library) or instrumentation_library == :undefined) do
-    to_jaeger_span(
-      name,
-      trace_id,
-      span_id,
-      parent_span_id,
-      flags,
-      start_time,
-      end_time,
-      attributes,
-      events
-    )
-  end
-
-  @spec to_jaeger_span(
-          binary() | atom(),
-          pos_integer() | :undefined,
-          pos_integer() | :undefined,
-          pos_integer() | :undefined,
-          integer() | :undefined,
-          :opentelemetry.timestamp(),
-          :opentelemetry.timestamp() | :undefined,
-          :opentelemetry.attributes() | :undefined,
-          :opentelemetry.events()
-        ) :: Span.t()
-  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp to_jaeger_span(
-         name,
-         trace_id,
-         span_id,
-         parent_span_id,
-         flags,
-         start_time,
-         end_time,
-         attributes,
-         events
-       ) do
     %Span{
       Span.new()
       | operation_name: to_string(name),
-        trace_id_low: to_jaeger_span_id(trace_id),
-        trace_id_high: 0,
+        trace_id_low: to_jaeger_trace_id(:low, trace_id),
+        trace_id_high: to_jaeger_trace_id(:high, trace_id),
         span_id: to_jaeger_span_id(span_id),
         parent_span_id: to_jaeger_span_id(parent_span_id),
         flags: to_jaeger_flags(flags),
         start_time: :opentelemetry.convert_timestamp(start_time, :microsecond),
         duration: to_duration(start_time, end_time),
         tags: to_jaeger_tags(attributes),
-        logs: to_jaeger_logs(events)
+        logs: to_jaeger_logs(events),
+        references: to_jaeger_span_refs(links, span_ref_type_mapper)
     }
+    |> add_jaeger_span_kind_tag(kind)
+  end
+
+  @spec to_jaeger_trace_id(:low | :high, :opentelemetry.trace_id() | :undefined) ::
+          non_neg_integer()
+  defp to_jaeger_trace_id(part, id)
+  defp to_jaeger_trace_id(_, :undefined), do: 0
+
+  defp to_jaeger_trace_id(part, id) when is_integer(id) and id > 0 do
+    case part do
+      :low ->
+        low = <<id::64>>
+        <<low::64-signed>> = low
+
+        low
+
+      :high ->
+        high = <<id::128>>
+        <<high::64-signed, _::binary>> = high
+
+        high
+    end
   end
 
   @spec to_jaeger_span_id(:opentelemetry.span_id() | :undefined) :: non_neg_integer()
@@ -427,12 +448,12 @@ defmodule OpenTelemetryJaeger do
     do: to_jaeger_tag(key, IO.iodata_to_binary(value))
 
   defp to_jaeger_tag(key, value) when is_binary(key) or is_atom(key) do
-    Tag.new()
-    |> Map.merge(%{
-      v_type: to_jaeger_tag_value_type(value),
-      key: to_string(key)
-    })
-    |> Map.put(get_jaeger_tag_value_key_name(value), value)
+    %Tag{
+      Tag.new()
+      | v_type: to_jaeger_tag_value_type(value),
+        key: to_string(key)
+    }
+    |> Map.replace!(get_jaeger_tag_value_key_name(value), value)
   end
 
   @spec get_jaeger_tag_value_key_name(bitstring() | number() | boolean() | nil) ::
@@ -448,7 +469,12 @@ defmodule OpenTelemetryJaeger do
   defp get_jaeger_tag_value_key_name(value) when is_boolean(value), do: :v_bool
   defp get_jaeger_tag_value_key_name(value) when is_bitstring(value), do: :v_binary
 
-  @spec to_jaeger_tag_value_type(bitstring() | number() | boolean() | nil) :: 0 | 1 | 2 | 3 | 4
+  @spec to_jaeger_tag_value_type(bitstring() | number() | boolean() | nil) ::
+          unquote(TagType.string())
+          | unquote(TagType.double())
+          | unquote(TagType.bool())
+          | unquote(TagType.long())
+          | unquote(TagType.binary())
   defp to_jaeger_tag_value_type(nil), do: TagType.string()
   defp to_jaeger_tag_value_type(value) when is_binary(value), do: TagType.string()
   defp to_jaeger_tag_value_type(value) when is_float(value), do: TagType.double()
@@ -480,12 +506,57 @@ defmodule OpenTelemetryJaeger do
     }
   end
 
-  # @spec to_span_kind(atom()) :: binary()
-  # defp to_span_kind(kind)
-  # defp to_span_kind(:undefined), do: "SPAN_KIND_UNSPECIFIED"
-  # defp to_span_kind(:INTERNAL), do: "SPAN_KIND_UNSPECIFIED"
-  # defp to_span_kind(:PRODUCER), do: "PRODUCER"
-  # defp to_span_kind(:CONSUMER), do: "CONSUMER"
-  # defp to_span_kind(:SERVER), do: "SERVER"
-  # defp to_span_kind(:CLIENT), do: "CLIENT"
+  @spec to_jaeger_span_refs(:opentelemetry.links(), struct()) :: [SpanRef.t()]
+  defp to_jaeger_span_refs(links, span_ref_type_mapper) do
+    links
+    |> to_jaeger_span_refs(span_ref_type_mapper, [])
+    |> Enum.reverse()
+  end
+
+  @spec to_jaeger_span_refs(:opentelemetry.links(), struct(), [SpanRef.t()]) :: [SpanRef.t()]
+  defp to_jaeger_span_refs(links, span_ref_type_mapper, span_refs)
+  defp to_jaeger_span_refs([], _span_ref_type_mapper, span_refs), do: span_refs
+
+  defp to_jaeger_span_refs([link | links], span_ref_type_mapper, span_refs) do
+    to_jaeger_span_refs(links, span_ref_type_mapper, [
+      to_jaeger_span_ref(link, span_ref_type_mapper) | span_refs
+    ])
+  end
+
+  @spec to_jaeger_span_ref(:opentelemetry.link(), struct()) :: SpanRef.t()
+  defp to_jaeger_span_ref(
+         {:link, trace_id, span_id, attributes, _trace_state},
+         span_ref_type_mapper
+       ) do
+    %SpanRef{
+      SpanRef.new()
+      | ref_type: SpanRefTypeMapper.resolve(span_ref_type_mapper, attributes),
+        trace_id_low: to_jaeger_trace_id(:low, trace_id),
+        trace_id_high: to_jaeger_trace_id(:high, trace_id),
+        span_id: to_jaeger_span_id(span_id)
+    }
+  end
+
+  @spec add_jaeger_span_kind_tag(Span.t(), atom()) :: Span.t()
+  defp add_jaeger_span_kind_tag(span, kind)
+  defp add_jaeger_span_kind_tag(span, :undefined), do: span
+
+  defp add_jaeger_span_kind_tag(%Span{tags: tags} = span, kind)
+       when kind in [:INTERNAL, :PRODUCER, :CONSUMER, :SERVER, :CLIENT] do
+    kind =
+      kind
+      |> to_string()
+      |> String.downcase()
+
+    kind_tag = %Tag{
+      Tag.new()
+      | key: "span.kind",
+        v_str: kind,
+        v_type: TagType.string()
+    }
+
+    tags = tags ++ [kind_tag]
+
+    %Span{span | tags: tags}
+  end
 end

@@ -23,6 +23,11 @@ config :opentelemetry,
         # Used only when `endpoint_type` is set to `:collector`.
         http_headers: [{"X-Foo", "Bar"}],
 
+        # Defaults to `OpenTelemetryJaeger.SpanRefTypeMapperDefault` and if set, the module must implement the
+        # `OpenTelemetryJaeger.SpanRefTypeMapper` protocol. It is used when using linking spans together and the
+        # implementation for `Any` returns `SpanRefType.child_of()`.
+        span_ref_type_mapper: MySpanRefTypeMapper,
+
         # https://hexdocs.pm/finch/Finch.html#start_link/1
         finch_settings: [],
 
@@ -38,6 +43,10 @@ config :opentelemetry,
 
 When the project is compiled, the [Jaeger Thrift IDL](https://github.com/jaegertracing/jaeger-idl/tree/master/thrift)
 files, stored in the `priv` directory, are compiled and the output is stored in `lib/jaeger/thrift`.
+
+For the meaning of the configuration key `span_ref_type_mapper`, see `OpenTelemetryJaeger.SpanRefTypeMapper`.
+
+Internally, `OpenTelemetryJaeger` starts a `DynamicSupervisor` to supervise the connection processes started by `Finch`.
 
 ## Installation
 
